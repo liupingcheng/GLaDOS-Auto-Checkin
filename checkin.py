@@ -3,6 +3,8 @@ GLaDOS 自动签到脚本
 支持多账号、多种推送渠道、重试机制、日志脱敏
 """
 import os
+import re
+import sys
 import json
 import time
 import random
@@ -27,6 +29,7 @@ HEADERS_BASE = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "content-type": "application/json;charset=UTF-8",
+    "accept": "application/json, text/plain, */*",
 }
 PAYLOAD = {"token": "glados.cloud"}
 TIMEOUT = 12
@@ -37,8 +40,6 @@ MIN_DELAY = 1.0
 MAX_DELAY = 2.0
 TELEGRAM_MAX_LENGTH = 4000
 TELEGRAM_TRUNCATE_LENGTH = 3990
-COOKIE_MASK_LENGTH = 10
-COOKIE_MIN_LENGTH = 20
 
 
 # ==================== 工具函数 ====================
@@ -73,28 +74,64 @@ def mask_email(email: str) -> str:
 
 
 def mask_cookie(cookie: str) -> str:
-    """Cookie 脱敏（只显示前后各10个字符）"""
-    if not cookie or len(cookie) <= COOKIE_MIN_LENGTH:
-        return "***"
-    return f"{cookie[:COOKIE_MASK_LENGTH]}...{cookie[-COOKIE_MASK_LENGTH:]}"
+    """会话 Cookie 不向公开 Actions 日志输出任何值。"""
+    return "***"
 
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    text = f"{title}\n\n{content}"
 
-    # Telegram 单条消息上限 4096 字符，做截断避免发送失败。
-    if len(text) > 4000:
-        text = text[:3990] + "..."
+def normalize_cookie(cookie: str) -> str:
+    cookie = cookie.strip()
+    if len(cookie) >= 2 and cookie[0] == cookie[-1] and cookie[0] in "\"'":
+        cookie = cookie[1:-1].strip()
+    return re.sub(r"^cookie\s*:\s*", "", cookie, flags=re.IGNORECASE)
+
+
+def parse_cookies(raw: str) -> List[str]:
+    """保留完整 Cookie 请求头；兼容原有 & 分隔和每行一个账号。"""
+    return [normalize_cookie(c) for c in re.split(r"\|\|\||&|\r?\n", raw) if c.strip()]
 
 def validate_cookie(cookie: str) -> Tuple[bool, str]:
     """验证 Cookie 是否包含必要字段"""
     if not cookie or not cookie.strip():
         return False, "Cookie 为空"
     cookie = cookie.strip()
-    if "koa:sess" not in cookie:
-        return False, "Cookie 缺少必要字段: koa:sess"
-    if "koa:sess.sig" not in cookie:
-        return False, "Cookie 缺少必要字段: koa:sess.sig"
-    return True, ""
+    values = {}
+    for part in cookie.split(";"):
+        key, separator, value = part.strip().partition("=")
+        if separator:
+            values[key.strip()] = value.strip()
+    for prefix in ("gld", "koa"):
+        if values.get(f"{prefix}:sess") and values.get(f"{prefix}:sess.sig"):
+            return True, ""
+    return False, "Cookie 需包含非空的 gld:sess 与 gld:sess.sig；请重新登录并复制完整 Cookie"
+
+
+def browser_headers() -> Dict[str, str]:
+    """使用签发会话的浏览器 User-Agent，满足新版登录设备校验。"""
+    headers = dict(HEADERS_BASE)
+    headers["user-agent"] = os.getenv("GLADOS_USER_AGENT", "").strip() or headers["user-agent"]
+    return headers
+
+
+def api_json(resp: requests.Response) -> Dict[str, Any]:
+    """HTTP 错误、HTML 错误页和异常 JSON 均不能冒充签到结果。"""
+    resp.raise_for_status()
+    try:
+        data = resp.json()
+    except ValueError:
+        raise requests.RequestException(f"接口返回非 JSON（HTTP {resp.status_code}）") from None
+    if not isinstance(data, dict):
+        raise requests.RequestException("接口返回了异常 JSON 格式")
+    return data
+
+
+def failure_message(data: Dict[str, Any]) -> str:
+    message = str(data.get("message") or "未知响应")
+    reason = str(data.get("reason", "")).lower()
+    if reason == "device-mismatch" or "automated check-in detected" in message.lower():
+        return "登录设备不匹配；请更新完整 COOKIES 和同一浏览器的 GLADOS_USER_AGENT"
+    if any(word in message.lower() for word in ("没有权限", "未登录", "unauthorized", "forbidden")):
+        return f"{message}；请重新登录 glados.cloud 并更新 COOKIES（含 gld:sess 与 gld:sess.sig）"
+    return message
 
 
 def retry_on_failure(max_retries: int = MAX_RETRY, min_wait: float = RETRY_MIN_WAIT,
@@ -107,8 +144,11 @@ def retry_on_failure(max_retries: int = MAX_RETRY, min_wait: float = RETRY_MIN_W
             for attempt in range(max_retries + 1):
                 try:
                     return func(*args, **kwargs)
-                except Exception as e:
+                except requests.RequestException as e:
                     last_exception = e
+                    response = getattr(e, "response", None)
+                    if response is not None and 400 <= response.status_code < 500 and response.status_code != 429:
+                        raise
                     if attempt < max_retries:
                         wait_time = min(min_wait * (2 ** attempt), max_wait)
                         print(f"⚠️ 第 {attempt + 1} 次尝试失败: {e}，{wait_time:.1f}秒后重试...")
@@ -390,20 +430,21 @@ def push_all(title: str, content: str) -> None:
 
 
 # ==================== 签到逻辑 ====================
-def classify_checkin(code: int, message: str) -> str:
+def classify_checkin(code: int, message: str, reason: str = "") -> str:
     """
     判断签到结果: ok / repeat / fail
-    GLaDOS API: code=0 成功, code=1 已签到, 其他失败
+    只接受明确的成功/重复签到结果，code=1 本身不能证明已签到。
     """
-    if code == 0:
-        return "ok"
-    if code == 1:
+    msg = str(message or "").lower()
+    if code in (-1, -2) or reason == "device-mismatch" or any(kw in msg for kw in (
+        "没有权限", "未登录", "unauthorized", "forbidden", "cookie expired",
+        "automated check-in detected", "please checkin via", "invalid token",
+    )):
+        return "fail"
+    if any(kw in msg for kw in ("checkin repeats", "checkin repeat", "already checked", "重复签到", "已签到", "签到过")):
         return "repeat"
-    msg = message.lower()
-    if "got" in msg:
+    if code == 0 or any(kw in msg for kw in ("checkin! got", "checkin success", "today's observation logged", "签到成功")):
         return "ok"
-    if any(kw in msg for kw in ("repeat", "already", "重复", "已签到", "签到过", "请勿")):
-        return "repeat"
     return "fail"
 
 
@@ -411,19 +452,19 @@ def classify_checkin(code: int, message: str) -> str:
 def checkin_request(session: requests.Session, headers: Dict[str, str]) -> Dict[str, Any]:
     """执行签到请求（带重试）"""
     r = session.post(CHECKIN_URL, headers=headers, data=json.dumps(PAYLOAD), timeout=TIMEOUT)
-    return safe_json(r)
+    return api_json(r)
 
 
 @retry_on_failure()
 def get_status(session: requests.Session, url: str, headers: Dict[str, str]) -> Dict[str, Any]:
     """查询账号状态/积分（带重试）"""
     r = session.get(url, headers=headers, timeout=TIMEOUT)
-    return safe_json(r)
+    return api_json(r)
 
 
-def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[str, str]:
+def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[str, Any]:
     """执行单个账号的签到，返回账号信息字典"""
-    headers = dict(HEADERS_BASE)
+    headers = browser_headers()
     headers["cookie"] = cookie
 
     email = "unknown"
@@ -433,19 +474,31 @@ def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[
     status = ""
 
     try:
-        # 1. 签到
+        # 1. 先验证登录态，失效会话不能被误报为「已签到」。
+        s = get_status(session, STATUS_URL, headers)
+        if s.get("code") != 0 or not isinstance(s.get("data"), dict):
+            raise RuntimeError(failure_message(s))
+        data = s["data"]
+        email = data.get("email") or email
+        if data.get("leftDays") is not None:
+            days = f"{int(float(data['leftDays']))} 天"
+
+        # 2. 签到
         j = checkin_request(session, headers)
         code = j.get("code", -2)
         message = j.get("message", "")
-        earned = j.get("points", 0) or 0
-        result = classify_checkin(code, message)
+        earned = j.get("points")
+        if earned is None:
+            match = re.search(r"(?:got|earned|获得)\s*(\d+)\s*(?:points?|点|积分)", str(message), re.IGNORECASE)
+            earned = int(match.group(1)) if match else None
+        result = classify_checkin(code, message, str(j.get("reason", "")))
 
         if result == "ok":
-            status = f"✅ 成功 (+{earned}积分)"
+            status = f"✅ 成功 (+{earned}积分)" if earned is not None else "✅ 成功"
         elif result == "repeat":
             status = "🔄 已签到"
         else:
-            status = f"❌ 失败({message})"
+            status = f"❌ 失败({failure_message(j)})"
 
         # 2. 查询账号状态（剩余天数、邮箱）
         try:
@@ -465,6 +518,10 @@ def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[
         except Exception:
             pass
 
+    except requests.HTTPError as e:
+        response = e.response
+        detail = failure_message(safe_json(response)) if response is not None else "HTTP 请求失败"
+        status = f"❌ 请求失败(HTTP {response.status_code if response is not None else '?'}: {detail})"
     except Exception as e:
         status = f"❌ 异常({e})"
 
@@ -478,29 +535,27 @@ def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[
 
 
 # ==================== 主流程 ====================
-def main() -> None:
-    cookies = [c.strip() for c in os.getenv("COOKIES", "").split("&") if c.strip()]
+def main() -> int:
+    cookies = parse_cookies(os.getenv("COOKIES", ""))
 
     if not cookies:
         push_all("GLaDOS 签到", "❌ 未检测到 COOKIES，请配置 GitHub Secrets")
-        return
+        return 1
 
     print(f"📋 检测到 {len(cookies)} 个账号")
 
-    # 验证 Cookie 格式
-    for idx, cookie in enumerate(cookies, 1):
-        is_valid, error_msg = validate_cookie(cookie)
-        if not is_valid:
-            print(f"⚠️ 账号 {idx} Cookie 格式异常: {error_msg}")
-            print(f"   Cookie 片段: {mask_cookie(cookie)}")
-
-    session = requests.Session()
     ok = fail = repeat = 0
     lines = []
 
     for idx, cookie in enumerate(cookies, 1):
         print(f"\n🔄 正在处理账号 {idx}/{len(cookies)}...")
-        acc = checkin_account(session, cookie, idx)
+        is_valid, error_msg = validate_cookie(cookie)
+        if is_valid:
+            # 账号各自使用独立会话，防止服务端 Set-Cookie 串到另一账号。
+            with requests.Session() as session:
+                acc = checkin_account(session, cookie, idx)
+        else:
+            acc = {"index": idx, "email": "unknown", "status": f"❌ 失败({error_msg})", "total_points": "-", "remaining_days": "-"}
 
         if "✅" in acc["status"]:
             ok += 1
@@ -526,7 +581,8 @@ def main() -> None:
     print(f"{'='*50}")
 
     push_all(title, content)
+    return 1 if fail else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

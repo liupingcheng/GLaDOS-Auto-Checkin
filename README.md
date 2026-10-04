@@ -43,15 +43,19 @@
 
 1. 打开浏览器，登录 https://glados.cloud
 2. 按 **F12** 打开开发者工具
-3. 找到 `Application` → `Cookies` → `glados.cloud`
-4. 复制完整 Cookie 内容
+3. 打开 `Network`，刷新控制台，选中一次成功的 `/api/user/status` 请求
+4. 从 `Request Headers` 复制完整的 `Cookie` 值，必须包含 `gld:sess` 和 `gld:sess.sig`
+5. 从同一次请求复制完整 `User-Agent`，用于新版登录设备校验
 
 示例：
 ```
-koa:sess=xxxxxx; koa:sess.sig=yyyyyy
+gld:sess=xxxxxx; gld:sess.sig=yyyyyy
 ```
 
 ⚠️ **必须是完整的一整段**
+
+保留其他 Cookie 字段，无需改名或删减。仅含旧版 `koa:sess` 的会话可能被新版接口拒绝。
+不要将 Cookie 提交到代码、Issue 或公开日志。
 
 ---
 
@@ -65,6 +69,10 @@ koa:sess=xxxxxx; koa:sess.sig=yyyyyy
    - **Name**：`COOKIES`
    - **Value**：粘贴刚才复制的 Cookie
 4. 点击 **Save**
+
+再添加 Secret `GLADOS_USER_AGENT`，值为签发当前 Cookie 的同一浏览器的完整
+`User-Agent`（也可以使用同名 Repository Variable）。浏览器升级或重新登录后，
+应一起更新 Cookie 和 User-Agent。手动运行一次 Actions，检查真正的签到结果。
 
 ---
 
@@ -93,7 +101,7 @@ koa:sess=xxxxxx; koa:sess.sig=yyyyyy
 cookie_账号1 & cookie_账号2 & cookie_账号3
 ```
 
-⚠️ 不要换行，不要用逗号
+也支持每行一个账号或用 `|||` 分隔，不要用逗号。每个 Cookie 请求头自身应保持单行。
 
 ---
 
@@ -118,6 +126,10 @@ cookie_账号1 & cookie_账号2 & cookie_账号3
 **Q: 签到提示 Cookie 失效？**
 
 A: Cookie 有有效期，请重新登录获取最新 Cookie 并更新 Secrets。
+
+若提示“没有权限”，从成功的 `/api/user/status` 请求中获取完整的新版会话；
+若提示 `device-mismatch` / `Automated check-in detected`，同时更新 `GLADOS_USER_AGENT`。
+新版脚本在签到失败、Cookie 缺失或格式错误时返回非零退出码，Actions 会正确显示失败。
 
 **Q: Actions 被暂停了？**
 
