@@ -487,6 +487,13 @@ def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[
         j = checkin_request(session, headers)
         code = j.get("code", -2)
         message = j.get("message", "")
+        # 记录明确的业务响应；Cookie 值绝不进入公开日志。
+        safe_message = str(message)
+        for part in cookie.split(";"):
+            _, separator, value = part.strip().partition("=")
+            if separator and value:
+                safe_message = safe_message.replace(value, "***")
+        print("   签到接口返回: " + json.dumps({"code": code, "message": safe_message}, ensure_ascii=False))
         earned = j.get("points")
         if earned is None:
             match = re.search(r"(?:got|earned|获得)\s*(\d+)\s*(?:points?|点|积分)", str(message), re.IGNORECASE)
