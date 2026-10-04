@@ -61,6 +61,11 @@ class ResultTests(unittest.TestCase):
     def test_explicit_repeat_is_successful_repeat(self):
         self.assertEqual(checkin.classify_checkin(1, "Checkin Repeats! Please Try Tomorrow"), "repeat")
 
+    def test_live_return_tomorrow_response_is_already_checked_in(self):
+        self.assertEqual(checkin.classify_checkin(
+            1, "Today's observation logged. Return tomorrow for more points."
+        ), "repeat")
+
     def test_historic_and_current_success_messages(self):
         for code, message in ((0, "Checkin! Got 15 Points"),
                               (1, "Today's observation logged. You've earned 20 points."),

@@ -441,7 +441,10 @@ def classify_checkin(code: int, message: str, reason: str = "") -> str:
         "automated check-in detected", "please checkin via", "invalid token",
     )):
         return "fail"
-    if any(kw in msg for kw in ("checkin repeats", "checkin repeat", "already checked", "重复签到", "已签到", "签到过")):
+    if any(kw in msg for kw in (
+        "checkin repeats", "checkin repeat", "already checked", "重复签到", "已签到", "签到过",
+        "today's observation logged. return tomorrow for more points.",
+    )):
         return "repeat"
     if code == 0 or any(kw in msg for kw in ("checkin! got", "checkin success", "today's observation logged", "签到成功")):
         return "ok"
