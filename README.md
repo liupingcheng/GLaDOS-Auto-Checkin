@@ -107,7 +107,12 @@ cookie_账号1 & cookie_账号2 & cookie_账号3
 
 ## ⏰ 签到时间
 
-每天 **UTC 04:00**（北京时间 **中午 12 点**）自动运行。
+每天计划在北京时间 **08:17、11:17、18:17** 尝试签到（UTC **00:17、03:17、10:17**）。
+首次签到成功后，后续尝试会显示“已签到”，不会重复获得积分。
+
+[GitHub Actions 定时调度](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
+可能延迟或漏发，尤其在整点高峰。错开整点并增加补签次数可以降低漏签风险，
+但不能保证中午前完成。若当天仍未签到，可在 **Actions → GLaDOS Auto Checkin → Run workflow** 手动补签。
 
 ---
 
