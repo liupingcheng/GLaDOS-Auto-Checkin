@@ -6,6 +6,7 @@ import os
 import re
 import sys
 import json
+import math
 import time
 import random
 import hashlib
@@ -18,6 +19,7 @@ import requests
 
 # ==================== 配置 ====================
 CHECKIN_URL = "https://glados.cloud/api/user/checkin"
+CHALLENGE_URL = CHECKIN_URL + "/challenge"
 STATUS_URL = "https://glados.cloud/api/user/status"
 POINTS_URL = "https://glados.cloud/api/user/points"
 HEADERS_BASE = {
@@ -32,6 +34,11 @@ HEADERS_BASE = {
     "accept": "application/json, text/plain, */*",
 }
 PAYLOAD = {"token": "glados.cloud"}
+# 官网 checkinProof：SHA-256(nonce + ".glados-observe-v1")。
+# 2026-11-12 官网客户端要求至少等待 2500 ms；额外留 200 ms 余量。
+CHALLENGE_WAIT = 2.7
+CHALLENGE_DEFAULT_TTL_MS = 300_000
+CHALLENGE_EXPIRY_MARGIN = 15.0
 TIMEOUT = 12
 MAX_RETRY = 3
 RETRY_MIN_WAIT = 2.0
@@ -436,7 +443,9 @@ def classify_checkin(code: int, message: str, reason: str = "") -> str:
     只接受明确的成功/重复签到结果，code=1 本身不能证明已签到。
     """
     msg = str(message or "").lower()
-    if code in (-1, -2) or reason == "device-mismatch" or any(kw in msg for kw in (
+    if code in (-1, -2) or reason in (
+        "device-mismatch", "turnstile", "challenge", "invalid-proof", "challenge-expired",
+    ) or any(kw in msg for kw in (
         "没有权限", "未登录", "unauthorized", "forbidden", "cookie expired",
         "automated check-in detected", "please checkin via", "invalid token",
     )):
@@ -451,11 +460,69 @@ def classify_checkin(code: int, message: str, reason: str = "") -> str:
     return "fail"
 
 
+class CheckinProtocolError(RuntimeError):
+    """验证不可用时停止提交；错误文案不包含验证参数或凭据。"""
+
+
+def protocol_json(response: requests.Response) -> Dict[str, Any]:
+    # 禁止把会话或一次性验证随重定向发送到其他地址。
+    if (300 <= response.status_code < 400 or
+            urllib.parse.urlsplit(response.url).netloc != urllib.parse.urlsplit(CHECKIN_URL).netloc or
+            urllib.parse.urlsplit(response.url).scheme != "https"):
+        raise CheckinProtocolError("签到接口发生重定向或变更域名，已停止提交")
+    return api_json(response)
+
+
+def prepare_checkin(session: requests.Session, headers: Dict[str, str]) -> Dict[str, str]:
+    """一次尝试使用一次验证；TTL 单位为官网返回的毫秒。"""
+    started = time.monotonic()
+    challenge = protocol_json(session.get(
+        CHALLENGE_URL, headers=headers, timeout=TIMEOUT, allow_redirects=False,
+    ))
+    if type(challenge.get("code")) is not int or challenge["code"] != 0:
+        raise CheckinProtocolError("获取签到验证失败；请检查登录状态或稍后重试")
+    nonce = challenge.get("nonce")
+    ttl = challenge.get("ttl", CHALLENGE_DEFAULT_TTL_MS)
+    if not isinstance(nonce, str) or not nonce.strip() or len(nonce) > 4096:
+        raise CheckinProtocolError("官网返回的签到验证无效，已停止提交")
+    if type(ttl) not in (int, float) or not math.isfinite(ttl) or ttl <= 0:
+        raise CheckinProtocolError("官网返回的验证有效期无效，已停止提交")
+    deadline = started + ttl / 1000 - CHALLENGE_EXPIRY_MARGIN
+    if time.monotonic() + CHALLENGE_WAIT >= deadline:
+        raise CheckinProtocolError("签到验证剩余有效期不足，已停止提交")
+    if challenge.get("turnstile") not in (None, False):
+        raise CheckinProtocolError(
+            "官网要求 Turnstile 浏览器验证；GitHub Actions 无法交互完成，"
+            "请在官网完成验证。未提交签到，也未回退旧流程"
+        )
+    time.sleep(CHALLENGE_WAIT)
+    if time.monotonic() >= deadline:
+        raise CheckinProtocolError("签到验证已过期，已停止提交")
+    proof = hashlib.sha256((nonce + ".glados-observe-v1").encode("utf-8")).hexdigest()
+    return {**PAYLOAD, "nonce": nonce, "proof": proof, "tsState": "off"}
+
+
 @retry_on_failure()
 def checkin_request(session: requests.Session, headers: Dict[str, str]) -> Dict[str, Any]:
-    """执行签到请求（带重试）"""
-    r = session.post(CHECKIN_URL, headers=headers, data=json.dumps(PAYLOAD), timeout=TIMEOUT)
-    return api_json(r)
+    """完整重试包含获取新验证，绝不重复使用已提交的 nonce。"""
+    payload = prepare_checkin(session, headers)
+    r = session.post(CHECKIN_URL, headers=headers, data=json.dumps(payload),
+                     timeout=TIMEOUT, allow_redirects=False)
+    result = protocol_json(r)
+    if type(result.get("code")) is not int:
+        raise CheckinProtocolError("签到接口返回了无效业务状态")
+    # 服务端若把参数反射进错误文案，也不能让 nonce/proof 进入日志或通知。
+    for key in ("message", "reason"):
+        if key in result:
+            text = str(result[key])
+            for secret in (payload["nonce"], payload["proof"]):
+                text = text.replace(secret, "***")
+            result[key] = text
+    if (result.get("points") is not None and
+            (type(result["points"]) not in (int, float) or not math.isfinite(result["points"]))):
+        result["points"] = None
+    print("   已按官网流程提交一次性签到验证（参数隐藏）", flush=True)
+    return result
 
 
 @retry_on_failure()
@@ -502,6 +569,8 @@ def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[
             match = re.search(r"(?:got|earned|获得)\s*(\d+)\s*(?:points?|点|积分)", str(message), re.IGNORECASE)
             earned = int(match.group(1)) if match else None
         result = classify_checkin(code, message, str(j.get("reason", "")))
+        if result == "ok" and j.get("repeated") is True:
+            result = "repeat"
 
         if result == "ok":
             status = f"✅ 成功 (+{earned}积分)" if earned is not None else "✅ 成功"
@@ -530,10 +599,17 @@ def checkin_account(session: requests.Session, cookie: str, index: int) -> Dict[
 
     except requests.HTTPError as e:
         response = e.response
-        detail = failure_message(safe_json(response)) if response is not None else "HTTP 请求失败"
+        # HTTP 错误正文可能反射 Cookie/nonce/proof；只输出状态及操作提示。
+        detail = ("认证被拒绝，请检查 COOKIES 和 GLADOS_USER_AGENT"
+                  if response is not None and response.status_code in (401, 403) else "接口请求失败")
         status = f"❌ 请求失败(HTTP {response.status_code if response is not None else '?'}: {detail})"
     except Exception as e:
         status = f"❌ 异常({e})"
+
+    for part in cookie.split(";"):
+        _, separator, value = part.strip().partition("=")
+        if separator and value:
+            status = status.replace(value, "***")
 
     return {
         "index": index,

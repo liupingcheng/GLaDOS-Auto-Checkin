@@ -136,6 +136,20 @@ A: Cookie 有有效期，请重新登录获取最新 Cookie 并更新 Secrets。
 若提示 `device-mismatch` / `Automated check-in detected`，同时更新 `GLADOS_USER_AGENT`。
 新版脚本在签到失败、Cookie 缺失或格式错误时返回非零退出码，Actions 会正确显示失败。
 
+**Q: 签到成功，但一直只有 1 积分？**
+
+A: 官网新增了一次性验证流程。本脚本现已按官网流程先获取 challenge，等待 2.7 秒，
+再在同一域名提交 nonce/proof；网络重试会重新获取验证，不会复用已提交的参数。
+验证无效、过期或重定向时停止提交，不回退到只带 token 的旧请求。
+日志和推送不包含 nonce/proof 或 Cookie 值。
+
+当前官网还包含 Turnstile 浏览器验证。如果服务端要求该验证，本脚本会明确失败，
+提示在官网完成验证，不伪造验证码或验证状态。GitHub Actions 无法交互完成该步骤。
+积分数额由服务端决定，不能保证固定奖励或补发差额；应以下一次首次签到的实际入账为准，
+同日重复签到只说明今日已记录，不能用来证明奖励已恢复。
+
+协议依据：[官网签到客户端](https://glados.cloud/console/checkin)（2026-11-12 核对）。
+
 **Q: Actions 被暂停了？**
 
 A: 项目内置每月空提交保活。如仍被暂停，手动触发一次 `workflow_dispatch`。

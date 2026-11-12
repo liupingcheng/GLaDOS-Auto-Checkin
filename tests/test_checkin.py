@@ -22,6 +22,10 @@ def response(payload=None, status=200, text=None):
     return result
 
 
+def challenge(nonce="browser-reference-nonce", **fields):
+    return response({"code": 0, "nonce": nonce, "ttl": 300000, **fields})
+
+
 class CookieTests(unittest.TestCase):
     def test_current_and_legacy_sessions_are_preserved(self):
         for cookie in (COOKIE, "koa:sess=old; koa:sess.sig=signature", "koa:sess=old; " + COOKIE):
@@ -80,27 +84,33 @@ class ResultTests(unittest.TestCase):
 
 
 class RequestTests(unittest.TestCase):
+    def session(self):
+        session = mock.Mock()
+        session.get.side_effect = lambda *a, **kw: challenge()
+        return session
+
     @mock.patch("checkin.time.sleep")
     def test_transient_http_error_is_retried(self, sleep):
-        session = mock.Mock()
+        session = self.session()
         session.post.side_effect = [response(status=503, text="<html>unavailable</html>"),
                                     response({"code": 0, "message": "Checkin! Got 20 Points"})]
         self.assertEqual(checkin.checkin_request(session, {})["code"], 0)
         self.assertEqual(session.post.call_count, 2)
-        sleep.assert_called_once()
+        self.assertEqual(session.get.call_count, 2)
+        self.assertEqual(sleep.call_args_list, [mock.call(2.7), mock.call(2.0), mock.call(2.7)])
 
     @mock.patch("checkin.time.sleep")
     def test_auth_http_error_is_not_retried(self, sleep):
-        session = mock.Mock()
+        session = self.session()
         session.post.return_value = response({"code": -2, "message": "没有权限"}, status=401)
         with self.assertRaises(requests.HTTPError):
             checkin.checkin_request(session, {})
         self.assertEqual(session.post.call_count, 1)
-        sleep.assert_not_called()
+        sleep.assert_called_once_with(2.7)
 
     @mock.patch("checkin.time.sleep")
     def test_rate_limit_is_retried(self, sleep):
-        session = mock.Mock()
+        session = self.session()
         session.post.side_effect = [response(status=429, text="slow down"), response({"code": 0})]
         self.assertEqual(checkin.checkin_request(session, {})["code"], 0)
         self.assertEqual(session.post.call_count, 2)
@@ -116,13 +126,15 @@ class AccountTests(unittest.TestCase):
         session = mock.Mock()
         session.get.side_effect = [
             response({"code": 0, "data": {"email": "test@example.com", "leftDays": "247.5"}}),
+            challenge(),
             response({"code": 0, "data": {"leftDays": "247.5"}}),
             response({"points": 331}),
         ]
         session.post.return_value = response(checkin_result)
         return session
 
-    def test_full_cookie_and_login_browser_are_sent(self):
+    @mock.patch("checkin.time.sleep")
+    def test_full_cookie_and_login_browser_are_sent(self, sleep):
         session = self.session({"code": 1, "message": "Today's observation logged. You've earned 20 points."})
         with mock.patch.dict(os.environ, {"GLADOS_USER_AGENT": USER_AGENT}):
             account = checkin.checkin_account(session, COOKIE, 1)
@@ -142,11 +154,192 @@ class AccountTests(unittest.TestCase):
         session.post.assert_not_called()
         self.assertEqual(session.get.call_count, 1)
 
-    def test_device_mismatch_is_failure_after_valid_login(self):
+    @mock.patch("checkin.time.sleep")
+    def test_device_mismatch_is_failure_after_valid_login(self, sleep):
         session = self.session({"code": 1, "message": "Automated check-in detected", "reason": "device-mismatch"})
         account = checkin.checkin_account(session, COOKIE, 1)
         self.assertIn("❌", account["status"])
         self.assertIn("GLADOS_USER_AGENT", account["status"])
+
+
+class ChallengeTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 1000.0
+        clock = mock.patch("checkin.time.monotonic", side_effect=lambda: self.now)
+        wait = mock.patch("checkin.time.sleep", side_effect=self.advance)
+        clock.start()
+        self.sleep = wait.start()
+        self.addCleanup(clock.stop)
+        self.addCleanup(wait.stop)
+
+    def advance(self, delay):
+        self.now += delay
+
+    def session(self):
+        session = mock.Mock()
+        session.get.return_value = challenge()
+        session.post.return_value = response({"code": 0, "message": "Checkin! Got 12 Points", "points": 12})
+        return session
+
+    def test_browser_reference_payload_and_wait(self):
+        session = self.session()
+        self.assertEqual(checkin.checkin_request(session, {"cookie": COOKIE})["points"], 12)
+        self.sleep.assert_called_once_with(2.7)
+        payload = json.loads(session.post.call_args.kwargs["data"])
+        self.assertEqual(payload, {
+            "token": "glados.cloud", "nonce": "browser-reference-nonce", "tsState": "off",
+            "proof": "7d4d4eeb87b7d4e9f358ef166b3ad76d595c7ca862291d544ca76b262e2ae71d",
+        })
+        self.assertEqual(session.get.call_args.args, (checkin.CHALLENGE_URL,))
+        self.assertEqual(session.post.call_args.args, (checkin.CHECKIN_URL,))
+        self.assertFalse(session.get.call_args.kwargs["allow_redirects"])
+        self.assertFalse(session.post.call_args.kwargs["allow_redirects"])
+        self.assertEqual(session.get.call_args.kwargs["headers"], session.post.call_args.kwargs["headers"])
+
+    def test_utf8_nonce_matches_browser_reference(self):
+        session = self.session()
+        session.get.return_value = challenge("测试-nonce-α")
+        checkin.checkin_request(session, {})
+        self.assertEqual(json.loads(session.post.call_args.kwargs["data"])["proof"],
+                         "ad866a617e8e6b5363517ebb55937be9e36485b299dfcec5efc534b2d94b13a7")
+
+    def test_bad_nonce_stops_without_token_only_fallback(self):
+        for nonce in (None, "", "  ", 17, {}, "x" * 4097):
+            with self.subTest(nonce_type=type(nonce).__name__):
+                session = self.session()
+                session.get.return_value = challenge(nonce)
+                with self.assertRaises(checkin.CheckinProtocolError):
+                    checkin.checkin_request(session, {})
+                session.post.assert_not_called()
+                self.assertEqual(session.get.call_count, 1)
+
+    def test_bad_or_too_short_ttl_stops_submission(self):
+        for ttl in (None, False, 0, -1, "300000", {}, float("nan"), float("inf"), 17000):
+            with self.subTest(ttl=ttl):
+                session = self.session()
+                session.get.return_value = challenge(ttl=ttl)
+                with self.assertRaises(checkin.CheckinProtocolError):
+                    checkin.checkin_request(session, {})
+                session.post.assert_not_called()
+
+    def test_missing_ttl_uses_official_default(self):
+        session = self.session()
+        session.get.return_value = response({"code": 0, "nonce": "browser-reference-nonce"})
+        self.assertEqual(checkin.checkin_request(session, {})["code"], 0)
+
+    def test_expiry_during_wait_stops_submission(self):
+        session = self.session()
+        self.sleep.side_effect = lambda delay: self.advance(300)
+        with self.assertRaisesRegex(checkin.CheckinProtocolError, "过期"):
+            checkin.checkin_request(session, {})
+        session.post.assert_not_called()
+
+    def test_fetch_latency_counts_towards_expiry(self):
+        session = self.session()
+        def slow_get(*args, **kwargs):
+            self.advance(290)
+            return challenge()
+        session.get.side_effect = slow_get
+        with self.assertRaises(checkin.CheckinProtocolError):
+            checkin.checkin_request(session, {})
+        session.post.assert_not_called()
+
+    def test_turnstile_is_not_faked_or_downgraded(self):
+        for config in ({"sitekey": "public-site-key"}, {}, True):
+            session = self.session()
+            session.get.return_value = challenge(turnstile=config)
+            with self.assertRaisesRegex(checkin.CheckinProtocolError, "Turnstile"):
+                checkin.checkin_request(session, {})
+            session.post.assert_not_called()
+            self.assertEqual(session.get.call_count, 1)
+
+    def test_logical_challenge_rejection_is_not_retried(self):
+        for code in (-2, 4, False, "0", None):
+            session = self.session()
+            session.get.return_value = response({"code": code, "message": "sensitive-nonce"})
+            with self.assertRaises(checkin.CheckinProtocolError) as exc:
+                checkin.checkin_request(session, {})
+            self.assertNotIn("sensitive-nonce", str(exc.exception))
+            session.post.assert_not_called()
+            self.assertEqual(session.get.call_count, 1)
+
+    def test_challenge_http_auth_rejection_is_not_retried(self):
+        session = self.session()
+        session.get.return_value = response(status=403, text="forbidden")
+        with self.assertRaises(requests.HTTPError):
+            checkin.checkin_request(session, {})
+        session.post.assert_not_called()
+        self.assertEqual(session.get.call_count, 1)
+
+    def test_http_retry_fetches_new_nonce_and_proof(self):
+        session = self.session()
+        session.get.side_effect = [challenge("first-nonce"), challenge("second-nonce")]
+        session.post.side_effect = [response(status=503, text="unavailable"), response({"code": 0})]
+        checkin.checkin_request(session, {})
+        payloads = [json.loads(call.kwargs["data"]) for call in session.post.call_args_list]
+        self.assertEqual([p["nonce"] for p in payloads], ["first-nonce", "second-nonce"])
+        self.assertNotEqual(payloads[0]["proof"], payloads[1]["proof"])
+        self.assertEqual(session.get.call_count, 2)
+
+    def test_get_retry_does_not_post_until_new_challenge_is_available(self):
+        session = self.session()
+        session.get.side_effect = [response(status=503, text="unavailable"), challenge()]
+        checkin.checkin_request(session, {})
+        self.assertEqual(session.get.call_count, 2)
+        self.assertEqual(session.post.call_count, 1)
+
+    def test_redirect_and_cross_origin_responses_are_rejected(self):
+        for phase in ("get", "post"):
+            for redirected in (response(status=302, text="redirect"), response({"code": 0})):
+                if redirected.status_code == 200:
+                    redirected.url = "https://other.example/api/user/checkin"
+                session = self.session()
+                getattr(session, phase).return_value = redirected
+                with self.assertRaises(checkin.CheckinProtocolError):
+                    checkin.checkin_request(session, {})
+                self.assertEqual(session.get.call_count, 1)
+                self.assertEqual(session.post.call_count, 0 if phase == "get" else 1)
+
+    def test_malformed_challenge_never_posts(self):
+        for result in (response(text="<html>login</html>"), response([])):
+            session = self.session()
+            session.get.return_value = result
+            with self.assertRaises(requests.RequestException):
+                checkin.prepare_checkin(session, {})
+            session.post.assert_not_called()
+
+    def test_reflected_nonce_and_proof_do_not_enter_logs_or_result(self):
+        session = self.session()
+        nonce = "browser-reference-nonce"
+        proof = "7d4d4eeb87b7d4e9f358ef166b3ad76d595c7ca862291d544ca76b262e2ae71d"
+        session.post.return_value = response({"code": 2, "message": nonce + " " + proof, "points": nonce})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = checkin.checkin_request(session, {})
+        self.assertNotIn(nonce, output.getvalue() + json.dumps(result))
+        self.assertNotIn(proof, output.getvalue() + json.dumps(result))
+        self.assertIsNone(result["points"])
+
+    def test_http_response_body_cannot_leak_validation_or_cookie(self):
+        session = AccountTests().session({})
+        secret = "browser-reference-nonce"
+        session.post.return_value = response({"message": secret + COOKIE}, status=403)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            account = checkin.checkin_account(session, COOKIE, 1)
+        self.assertIn("HTTP 403", account["status"])
+        self.assertNotIn(secret, output.getvalue() + json.dumps(account))
+        self.assertNotIn("test-session", output.getvalue() + json.dumps(account))
+
+    def test_official_repeat_flag_and_rejection_take_priority(self):
+        for result, expected in (
+            ({"code": 0, "message": "Recorded", "repeated": True}, "🔄"),
+            ({"code": 0, "message": "Recorded", "reason": "turnstile", "repeated": True}, "❌"),
+            ({"code": 0, "message": "Checkin! Got 1 Points", "points": 1}, "✅"),
+        ):
+            session = AccountTests().session(result)
+            account = checkin.checkin_account(session, COOKIE, 1)
+            self.assertIn(expected, account["status"])
 
 
 class MainTests(unittest.TestCase):
