@@ -159,7 +159,7 @@ GitHub Actions 会自动安装依赖，并通过 Xvfb 提供浏览器图形环�
 无界面及 Xvfb 图形浏览器均未完成官网 Turnstile；最后一次诊断为验证状态 `error`、
 Turnstile 请求 HTTP 400，脚本已停止提交。本仓库的无人值守签到尚未恢复，
 不能据此承诺积分奖励已恢复；需进一步确认官网对该执行环境的验证支持。
-[真实验证记录](https://github.com/liupingcheng/GLaDOS-Auto-Checkin/actions/runs/43209078399)。
+[真实验证记录](https://github.com/liupingcheng/GLaDOS-Auto-Checkin/actions/runs/43210319795)。
 
 **Q: Actions 被暂停了？**
 
