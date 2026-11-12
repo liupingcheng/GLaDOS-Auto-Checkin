@@ -18,6 +18,17 @@ def turnstile_error_code(text):
     return match.group(1) if match else None
 
 
+def turnstile_response_diagnostics(text):
+    codes = set(re.findall(
+        r'(?i)["\']?(?:error[ _-]?code|code)["\']?\s*[:=]\s*["\']?((?:110|200|300|400|600)[0-9]{3})\b', text,
+    ))
+    labels = {label for phrase, label in (
+        ("invalid sitekey", "invalid-sitekey"), ("domain not authorized", "domain-not-authorized"),
+        ("unsupported browser", "unsupported-browser"), ("bad request", "bad-request"),
+    ) if phrase in text.lower()}
+    return codes, labels
+
+
 def browser_cookies(raw, origin):
     cookies = []
     for part in raw.split(";"):
@@ -64,7 +75,7 @@ def browser_checkin(headers, checkin_url, challenge_url):
     if origin != "https://glados.cloud" or challenge_url != checkin_url + "/challenge":
         raise BrowserFlowError("浏览器签到仅允许官网同域接口")
     state = {"challenge": None, "result": None, "error": None, "submitted": False, "secrets": []}
-    diagnostics = {"codes": set(), "http": set(), "network": set(), "state": "未提交"}
+    diagnostics = {"codes": set(), "http": set(), "network": set(), "labels": set(), "state": "未提交"}
 
     def console(message):
         code = turnstile_error_code(message.text)
@@ -79,7 +90,7 @@ def browser_checkin(headers, checkin_url, challenge_url):
 
     def diagnostic_error(message):
         fields = ["状态=" + diagnostics["state"]]
-        for key, label in (("codes", "错误码"), ("http", "HTTP"), ("network", "网络")):
+        for key, label in (("codes", "错误码"), ("http", "HTTP"), ("network", "网络"), ("labels", "分类")):
             if diagnostics[key]:
                 fields.append(label + "=" + ",".join(map(str, sorted(diagnostics[key])))[:160])
         return BrowserFlowError(message + "（" + "；".join(fields) + "）")
@@ -88,6 +99,9 @@ def browser_checkin(headers, checkin_url, challenge_url):
         try:
             if urlsplit(response.url).hostname == "challenges.cloudflare.com" and response.status >= 400:
                 diagnostics["http"].add(response.status)
+                codes, labels = turnstile_response_diagnostics(response.text())
+                diagnostics["codes"].update(codes)
+                diagnostics["labels"].update(labels)
             if response.url == challenge_url:
                 if response.status != 200:
                     state["error"] = "官网浏览器获取签到验证失败"

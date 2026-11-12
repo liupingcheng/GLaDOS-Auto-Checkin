@@ -8,7 +8,10 @@ from unittest import mock
 import requests
 
 import checkin
-from browser_checkin import BrowserFlowError, browser_cookies, validate_submission, turnstile_error_code
+from browser_checkin import (
+    BrowserFlowError, browser_cookies, validate_submission,
+    turnstile_error_code, turnstile_response_diagnostics,
+)
 
 
 COOKIE = "gld:sess=test-session; gld:sess.sig=test-signature; optional=keep"
@@ -358,6 +361,14 @@ class ChallengeTests(unittest.TestCase):
 
 
 class BrowserGuardTests(unittest.TestCase):
+    def test_cloudflare_body_diagnostic_returns_only_codes_and_fixed_labels(self):
+        codes, labels = turnstile_response_diagnostics(
+            '{"code":110200,"nonce":"PRIVATE-TEST-NONCE","message":"Domain not authorized"}'
+        )
+        self.assertEqual(codes, {"110200"})
+        self.assertEqual(labels, {"domain-not-authorized"})
+        self.assertEqual(turnstile_response_diagnostics("PRIVATE-TEST-NONCE"), (set(), set()))
+
     def test_console_diagnostic_extracts_only_known_numeric_error_code(self):
         self.assertEqual(turnstile_error_code("[Cloudflare Turnstile] Error: 600010. private-data"), "600010")
         self.assertIsNone(turnstile_error_code("Cookie private-data Error: 600010"))
