@@ -11,6 +11,13 @@ class BrowserFlowError(RuntimeError):
     """只携带固定的脱敏错误文案。"""
 
 
+def turnstile_error_code(text):
+    if "[cloudflare turnstile]" not in text.lower():
+        return None
+    match = re.search(r"\b(?:error(?: code)?|code):?\s*([0-9]{6})\b", text, re.IGNORECASE)
+    return match.group(1) if match else None
+
+
 def browser_cookies(raw, origin):
     cookies = []
     for part in raw.split(";"):
@@ -57,9 +64,30 @@ def browser_checkin(headers, checkin_url, challenge_url):
     if origin != "https://glados.cloud" or challenge_url != checkin_url + "/challenge":
         raise BrowserFlowError("浏览器签到仅允许官网同域接口")
     state = {"challenge": None, "result": None, "error": None, "submitted": False, "secrets": []}
+    diagnostics = {"codes": set(), "http": set(), "network": set(), "state": "未提交"}
+
+    def console(message):
+        code = turnstile_error_code(message.text)
+        if code:
+            diagnostics["codes"].add(code)
+
+    def failed(request):
+        if urlsplit(request.url).hostname == "challenges.cloudflare.com":
+            match = re.search(r"net::(ERR_[A-Z_]+)", request.failure or "")
+            if match:
+                diagnostics["network"].add(match.group(1))
+
+    def diagnostic_error(message):
+        fields = ["状态=" + diagnostics["state"]]
+        for key, label in (("codes", "错误码"), ("http", "HTTP"), ("network", "网络")):
+            if diagnostics[key]:
+                fields.append(label + "=" + ",".join(map(str, sorted(diagnostics[key])))[:160])
+        return BrowserFlowError(message + "（" + "；".join(fields) + "）")
 
     def observe(response):
         try:
+            if urlsplit(response.url).hostname == "challenges.cloudflare.com" and response.status >= 400:
+                diagnostics["http"].add(response.status)
             if response.url == challenge_url:
                 if response.status != 200:
                     state["error"] = "官网浏览器获取签到验证失败"
@@ -87,6 +115,8 @@ def browser_checkin(headers, checkin_url, challenge_url):
                 if state["submitted"]:
                     raise BrowserFlowError("本次浏览器流程已经提交，已阻止重复请求")
                 payload = request.post_data_json
+                if isinstance(payload, dict) and payload.get("tsState") in ("off", "ok", "error", "timeout"):
+                    diagnostics["state"] = payload["tsState"]
                 validate_submission(payload, state["challenge"], time.monotonic())
                 state["secrets"] = [payload["nonce"], payload["proof"], payload.get("turnstile", "")]
                 state["submitted"] = True
@@ -111,6 +141,8 @@ def browser_checkin(headers, checkin_url, challenge_url):
                 page = context.new_page()
                 page.route("**/*", guard)
                 page.on("response", observe)
+                page.on("console", console)
+                page.on("requestfailed", failed)
                 page.goto(origin + "/console/checkin", wait_until="domcontentloaded", timeout=40000)
                 if urlsplit(page.url).path != "/console/checkin":
                     raise BrowserFlowError("官网浏览器未进入已登录的签到页")
@@ -120,7 +152,7 @@ def browser_checkin(headers, checkin_url, challenge_url):
                 while state["result"] is None and state["error"] is None and time.monotonic() < deadline:
                     page.wait_for_timeout(200)
                 if state["error"]:
-                    raise BrowserFlowError(state["error"])
+                    raise diagnostic_error(state["error"])
                 if not isinstance(state["result"], dict) or not state["submitted"]:
                     raise BrowserFlowError("官网浏览器验证未完成或请求超时；未取得签到结果")
                 print("   官网浏览器已提交完整验证请求", flush=True)
@@ -128,4 +160,4 @@ def browser_checkin(headers, checkin_url, challenge_url):
             finally:
                 browser.close()
     except PlaywrightError:
-        raise BrowserFlowError(state["error"] or "官网浏览器流程未完成；可能需要人工验证或检查浏览器依赖") from None
+        raise diagnostic_error(state["error"] or "官网浏览器流程未完成；可能需要人工验证或检查浏览器依赖") from None
