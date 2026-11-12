@@ -37,7 +37,7 @@ jobs:
         run: python -m playwright install --with-deps chromium
 
       - name: Run checkin
-        run: python checkin.py
+        run: xvfb-run -a python checkin.py
         env:
           COOKIES: ${{ secrets.COOKIES }}
           GLADOS_USER_AGENT: ${{ secrets.GLADOS_USER_AGENT || vars.GLADOS_USER_AGENT }}

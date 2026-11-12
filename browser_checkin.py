@@ -1,6 +1,7 @@
 """在隔离浏览器中运行官网自身的签到流程，不保存会话、截图或网络跟踪。"""
 import hashlib
 import math
+import os
 import re
 import time
 from urllib.parse import urlsplit
@@ -103,7 +104,7 @@ def browser_checkin(headers, checkin_url, challenge_url):
     print("   官网要求浏览器验证，正在运行官网自身的签到页面", flush=True)
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch()
+            browser = playwright.chromium.launch(headless=not bool(os.environ.get("DISPLAY")))
             try:
                 context = browser.new_context(user_agent=headers["user-agent"], locale="en-US")
                 context.add_cookies(browser_cookies(headers["cookie"], origin))
