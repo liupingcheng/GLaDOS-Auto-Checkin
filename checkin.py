@@ -464,6 +464,10 @@ class CheckinProtocolError(RuntimeError):
     """验证不可用时停止提交；错误文案不包含验证参数或凭据。"""
 
 
+class BrowserVerificationRequired(CheckinProtocolError):
+    """服务端要求官网浏览器验证，转交隔离浏览器正常执行。"""
+
+
 def protocol_json(response: requests.Response) -> Dict[str, Any]:
     # 禁止把会话或一次性验证随重定向发送到其他地址。
     if (300 <= response.status_code < 400 or
@@ -491,10 +495,7 @@ def prepare_checkin(session: requests.Session, headers: Dict[str, str]) -> Dict[
     if time.monotonic() + CHALLENGE_WAIT >= deadline:
         raise CheckinProtocolError("签到验证剩余有效期不足，已停止提交")
     if challenge.get("turnstile") not in (None, False):
-        raise CheckinProtocolError(
-            "官网要求 Turnstile 浏览器验证；GitHub Actions 无法交互完成，"
-            "请在官网完成验证。未提交签到，也未回退旧流程"
-        )
+        raise BrowserVerificationRequired("官网要求 Turnstile 浏览器验证")
     time.sleep(CHALLENGE_WAIT)
     if time.monotonic() >= deadline:
         raise CheckinProtocolError("签到验证已过期，已停止提交")
@@ -505,18 +506,28 @@ def prepare_checkin(session: requests.Session, headers: Dict[str, str]) -> Dict[
 @retry_on_failure()
 def checkin_request(session: requests.Session, headers: Dict[str, str]) -> Dict[str, Any]:
     """完整重试包含获取新验证，绝不重复使用已提交的 nonce。"""
-    payload = prepare_checkin(session, headers)
-    r = session.post(CHECKIN_URL, headers=headers, data=json.dumps(payload),
-                     timeout=TIMEOUT, allow_redirects=False)
-    result = protocol_json(r)
+    try:
+        payload = prepare_checkin(session, headers)
+    except BrowserVerificationRequired:
+        from browser_checkin import browser_checkin, BrowserFlowError
+        try:
+            result, secrets = browser_checkin(headers, CHECKIN_URL, CHALLENGE_URL)
+        except BrowserFlowError as exc:
+            raise CheckinProtocolError(str(exc)) from None
+    else:
+        r = session.post(CHECKIN_URL, headers=headers, data=json.dumps(payload),
+                         timeout=TIMEOUT, allow_redirects=False)
+        result = protocol_json(r)
+        secrets = [payload["nonce"], payload["proof"]]
     if type(result.get("code")) is not int:
         raise CheckinProtocolError("签到接口返回了无效业务状态")
     # 服务端若把参数反射进错误文案，也不能让 nonce/proof 进入日志或通知。
     for key in ("message", "reason"):
         if key in result:
             text = str(result[key])
-            for secret in (payload["nonce"], payload["proof"]):
-                text = text.replace(secret, "***")
+            for secret in secrets:
+                if secret:
+                    text = text.replace(secret, "***")
             result[key] = text
     if (result.get("points") is not None and
             (type(result["points"]) not in (int, float) or not math.isfinite(result["points"]))):

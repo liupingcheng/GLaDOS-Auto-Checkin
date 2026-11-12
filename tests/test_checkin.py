@@ -8,6 +8,7 @@ from unittest import mock
 import requests
 
 import checkin
+from browser_checkin import BrowserFlowError, browser_cookies, validate_submission
 
 
 COOKIE = "gld:sess=test-session; gld:sess.sig=test-signature; optional=keep"
@@ -244,7 +245,8 @@ class ChallengeTests(unittest.TestCase):
             checkin.checkin_request(session, {})
         session.post.assert_not_called()
 
-    def test_turnstile_is_not_faked_or_downgraded(self):
+    @mock.patch("browser_checkin.browser_checkin", side_effect=BrowserFlowError("Turnstile 未通过"))
+    def test_turnstile_is_not_faked_or_downgraded(self, browser):
         for config in ({"sitekey": "public-site-key"}, {}, True):
             session = self.session()
             session.get.return_value = challenge(turnstile=config)
@@ -252,6 +254,19 @@ class ChallengeTests(unittest.TestCase):
                 checkin.checkin_request(session, {})
             session.post.assert_not_called()
             self.assertEqual(session.get.call_count, 1)
+        self.assertEqual(browser.call_count, 3)
+
+    @mock.patch("browser_checkin.browser_checkin")
+    def test_browser_adapter_does_not_post_old_payload_and_redacts_token(self, browser):
+        session = self.session()
+        session.get.return_value = challenge(turnstile={"sitekey": "public"})
+        browser.return_value = ({"code": 1, "message": "test-nonce test-proof test-turnstile"},
+                                ["test-nonce", "test-proof", "test-turnstile"])
+        result = checkin.checkin_request(session, {"cookie": COOKIE})
+        self.assertEqual(result["message"], "*** *** ***")
+        session.post.assert_not_called()
+        self.sleep.assert_not_called()
+        browser.assert_called_once_with({"cookie": COOKIE}, checkin.CHECKIN_URL, checkin.CHALLENGE_URL)
 
     def test_logical_challenge_rejection_is_not_retried(self):
         for code in (-2, 4, False, "0", None):
@@ -340,6 +355,49 @@ class ChallengeTests(unittest.TestCase):
             session = AccountTests().session(result)
             account = checkin.checkin_account(session, COOKIE, 1)
             self.assertIn(expected, account["status"])
+
+
+class BrowserGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.challenge = {"code": 0, "nonce": "browser-reference-nonce", "ttl": 300000,
+                          "turnstile": {"sitekey": "public"}, "received_at": 1000.0}
+        self.payload = {"token": "glados.cloud", "nonce": "browser-reference-nonce",
+                        "proof": "7d4d4eeb87b7d4e9f358ef166b3ad76d595c7ca862291d544ca76b262e2ae71d",
+                        "tsState": "ok", "turnstile": "synthetic-unit-test-token"}
+
+    def test_official_completed_submission_is_allowed(self):
+        validate_submission(self.payload, self.challenge, 1003)
+
+    def test_incomplete_or_downgraded_submission_is_blocked(self):
+        for patch in ({"nonce": "other-nonce"}, {"proof": "wrong"}, {"token": "other.example"},
+                      {"tsState": "off"}, {"tsState": "timeout"}, {"turnstile": ""},
+                      {"turnstile": True}, {"turnstile": {"token": "fake"}}):
+            with self.subTest(field=list(patch)):
+                with self.assertRaises(BrowserFlowError):
+                    validate_submission({**self.payload, **patch}, self.challenge, 1003)
+        with self.assertRaises(BrowserFlowError):
+            validate_submission({"token": "glados.cloud"}, self.challenge, 1003)
+
+    def test_expired_rejected_and_missing_challenges_are_blocked(self):
+        for challenge_data in (None, {**self.challenge, "code": -2}, {**self.challenge, "code": False},
+                               {**self.challenge, "ttl": "300000"}, {**self.challenge, "ttl": float("inf")}):
+            with self.assertRaises(BrowserFlowError):
+                validate_submission(self.payload, challenge_data, 1003)
+        with self.assertRaises(BrowserFlowError):
+            validate_submission(self.payload, self.challenge, 1290)
+
+    def test_off_state_allowed_only_without_turnstile_requirement(self):
+        validate_submission({**self.payload, "tsState": "off"},
+                            {**self.challenge, "turnstile": None}, 1003)
+        with self.assertRaises(BrowserFlowError):
+            validate_submission(self.payload, {**self.challenge, "turnstile": None}, 1003)
+
+    def test_cookies_remain_scoped_to_the_official_origin(self):
+        cookies = browser_cookies(COOKIE, "https://glados.cloud")
+        self.assertEqual({c["name"] for c in cookies}, {"gld:sess", "gld:sess.sig", "optional"})
+        self.assertTrue(all(c["url"] == "https://glados.cloud" for c in cookies))
+        with self.assertRaises(BrowserFlowError):
+            browser_cookies("", "https://glados.cloud")
 
 
 class MainTests(unittest.TestCase):
