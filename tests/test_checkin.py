@@ -412,6 +412,9 @@ class BrowserGuardTests(unittest.TestCase):
         cookies = browser_cookies(COOKIE, "https://glados.cloud")
         self.assertEqual({c["name"] for c in cookies}, {"gld:sess", "gld:sess.sig", "optional"})
         self.assertTrue(all(c["url"] == "https://glados.cloud" for c in cookies))
+        self.assertTrue(all(c["secure"] and c["sameSite"] == "Lax" for c in cookies))
+        self.assertTrue(all(c["httpOnly"] for c in cookies if c["name"].startswith("gld:")))
+        self.assertFalse(next(c for c in cookies if c["name"] == "optional")["httpOnly"])
         with self.assertRaises(BrowserFlowError):
             browser_cookies("", "https://glados.cloud")
 

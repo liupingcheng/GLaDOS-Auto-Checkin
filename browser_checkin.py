@@ -34,7 +34,9 @@ def browser_cookies(raw, origin):
     for part in raw.split(";"):
         name, separator, value = part.strip().partition("=")
         if separator and name and value:
-            cookies.append({"name": name, "value": value, "url": origin})
+            cookies.append({"name": name, "value": value, "url": origin,
+                            "secure": True, "sameSite": "Lax",
+                            "httpOnly": name.startswith(("gld:", "koa:"))})
     if not cookies:
         raise BrowserFlowError("浏览器签到缺少会话 Cookie")
     return cookies
@@ -99,9 +101,12 @@ def browser_checkin(headers, checkin_url, challenge_url):
         try:
             if urlsplit(response.url).hostname == "challenges.cloudflare.com" and response.status >= 400:
                 diagnostics["http"].add(response.status)
-                codes, labels = turnstile_response_diagnostics(response.text())
-                diagnostics["codes"].update(codes)
-                diagnostics["labels"].update(labels)
+                try:
+                    codes, labels = turnstile_response_diagnostics(response.text())
+                    diagnostics["codes"].update(codes)
+                    diagnostics["labels"].update(labels)
+                except Exception:
+                    pass  # 可选诊断正文不可读时，不覆盖真正的验证结果。
             if response.url == challenge_url:
                 if response.status != 200:
                     state["error"] = "官网浏览器获取签到验证失败"
