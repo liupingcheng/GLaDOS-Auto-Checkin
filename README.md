@@ -163,7 +163,11 @@ Turnstile 请求 HTTP 400，旧版在客户端停止了提交，无人值守签�
 
 2026-11-17 修正：官网会将真实 `error` / `timeout` 状态提交给服务端，
 此前额外的客户端拦截导致任务在签到提交前退出，现已对齐官网行为。
-49 项离线测试通过；离线测试不能证明账号已签到或奖励已恢复，仍需查看真实运行结果。
+49 项离线测试通过。部署后真实运行已提交官网生成的 `timeout` 状态，
+服务端返回 `code=5` 和 `Cloudflare verification failed. Nothing was recorded — please retry.`，
+任务如实失败；同日正常 Edge 官网页面也出现 `Human verification timed out` 和 `Not counted 0 pts`。
+无人值守签到仍未恢复，不能将本次协议修正、登录成功或测试通过当作签到成功。
+[本次真实验证记录](https://github.com/liupingcheng/GLaDOS-Auto-Checkin/actions/runs/44014594888)。
 
 **Q: Actions 被暂停了？**
 
