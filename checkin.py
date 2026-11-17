@@ -532,7 +532,7 @@ def checkin_request(session: requests.Session, headers: Dict[str, str]) -> Dict[
     if (result.get("points") is not None and
             (type(result["points"]) not in (int, float) or not math.isfinite(result["points"]))):
         result["points"] = None
-    print("   已按官网流程提交一次性签到验证（参数隐藏）", flush=True)
+    print("   已按官网流程提交签到请求（验证参数隐藏，以服务端结果为准）", flush=True)
     return result
 
 

@@ -384,9 +384,29 @@ class BrowserGuardTests(unittest.TestCase):
     def test_official_completed_submission_is_allowed(self):
         validate_submission(self.payload, self.challenge, 1003)
 
+    def test_official_error_and_timeout_states_are_forwarded_without_forging_a_token(self):
+        for state in ("error", "timeout"):
+            payload = {**self.payload, "tsState": state}
+            del payload["turnstile"]
+            validate_submission(payload, self.challenge, 1003)
+            self.assertEqual(payload["tsState"], state)
+            self.assertNotIn("turnstile", payload)
+
+    def test_server_rejection_after_browser_submission_still_fails_the_account(self):
+        session = AccountTests().session({})
+        responses = list(session.get.side_effect)
+        responses[1] = challenge(turnstile={"sitekey": "public"})
+        session.get.side_effect = responses
+        rejection = {"code": 5, "reason": "turnstile", "message": "Verification required"}
+        with mock.patch("browser_checkin.browser_checkin", return_value=(rejection, [])) as browser:
+            result = checkin.checkin_account(session, COOKIE, 1)
+        self.assertIn("❌", result["status"])
+        browser.assert_called_once()
+        session.post.assert_not_called()
+
     def test_incomplete_or_downgraded_submission_is_blocked(self):
         for patch in ({"nonce": "other-nonce"}, {"proof": "wrong"}, {"token": "other.example"},
-                      {"tsState": "off"}, {"tsState": "timeout"}, {"turnstile": ""},
+                      {"tsState": "off"}, {"tsState": "timeout"}, {"tsState": "unknown"}, {"turnstile": ""},
                       {"turnstile": True}, {"turnstile": {"token": "fake"}}):
             with self.subTest(field=list(patch)):
                 with self.assertRaises(BrowserFlowError):

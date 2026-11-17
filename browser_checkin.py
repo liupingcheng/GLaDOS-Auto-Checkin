@@ -43,7 +43,7 @@ def browser_cookies(raw, origin):
 
 
 def validate_submission(payload, challenge, now):
-    """只放行官网生成的完整请求；失败时不提交低积分的旧流程。"""
+    """校验官网请求完整性；验证状态如实提交，由服务端作业务判断。"""
     if (not isinstance(payload, dict) or not challenge or
             type(challenge.get("code")) is not int or challenge["code"] != 0):
         raise BrowserFlowError("官网浏览器未取得有效签到验证，已停止提交")
@@ -59,9 +59,17 @@ def validate_submission(payload, challenge, now):
     if payload.get("token") != "glados.cloud":
         raise BrowserFlowError("官网浏览器签到域名不匹配，已停止提交")
     if challenge.get("turnstile") not in (None, False):
-        if (payload.get("tsState") != "ok" or
-                not isinstance(payload.get("turnstile"), str) or not payload["turnstile"].strip()):
-            raise BrowserFlowError("官网 Turnstile 未通过；需要在正常浏览器中完成验证，未提交签到")
+        state = payload.get("tsState")
+        if state == "ok":
+            if not isinstance(payload.get("turnstile"), str) or not payload["turnstile"].strip():
+                raise BrowserFlowError("官网浏览器未提供对应的验证令牌，已停止提交")
+        elif state in ("error", "timeout"):
+            # 官网 solveChallenge 也会提交这些真实结果；不得伪造成 ok/off，
+            # 也不能在客户端把它等同于服务端已拒绝本次签到。
+            if "turnstile" in payload:
+                raise BrowserFlowError("官网浏览器验证状态与令牌矛盾，已停止提交")
+        else:
+            raise BrowserFlowError("官网浏览器验证状态无效，已停止提交")
     elif payload.get("tsState") != "off":
         raise BrowserFlowError("官网浏览器验证状态不一致，已停止提交")
 
@@ -174,7 +182,7 @@ def browser_checkin(headers, checkin_url, challenge_url):
                     raise diagnostic_error(state["error"])
                 if not isinstance(state["result"], dict) or not state["submitted"]:
                     raise BrowserFlowError("官网浏览器验证未完成或请求超时；未取得签到结果")
-                print("   官网浏览器已提交完整验证请求", flush=True)
+                print("   官网浏览器已提交签到请求（验证状态=" + diagnostics["state"] + "）", flush=True)
                 return state["result"], state["secrets"]
             finally:
                 browser.close()
